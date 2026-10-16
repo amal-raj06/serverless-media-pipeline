@@ -1,0 +1,8 @@
+{
+  "QueueConfigurations": [
+    {
+      "QueueArn": "arn:aws:sqs:ap-south-1:777772816164:media-processing-queue",
+      "Events": ["s3:ObjectCreated:*"]
+    }
+  ]
+}

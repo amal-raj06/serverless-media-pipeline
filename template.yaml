@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Enterprise Serverless Media Ingestion, Governance, Cognito Auth & SNS Fan-Out Platform
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.11
+    Tracing: Active
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        TABLE_NAME: MediaMetadataTable
+        RAW_BUCKET: media-ingestion-raw-777772816164-ap-south-1
+        PROCESSED_BUCKET: !Ref ProcessedOutputBucket
+
+Resources:
+
+  # ------------------------------------------------------------
+  # 0. Governance & SSM Parameter Configuration Store
+  # ------------------------------------------------------------
+  RawBucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /media-pipeline/s3/raw-bucket-name
+      Type: String
+      Value: media-ingestion-raw-777772816164-ap-south-1
+      Description: Global SSM parameter for Raw Ingestion S3 Bucket Name
+
+  # ------------------------------------------------------------
+  # 1. Authentication (Amazon Cognito User Pool & Client)
+  # ------------------------------------------------------------
+  MediaUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: media-pipeline-user-pool
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  MediaUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: media-pipeline-client
+      UserPoolId: !Ref MediaUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  # ------------------------------------------------------------
+  # 2. DynamoDB Registry Table
+  # ------------------------------------------------------------
+  MediaMetadataTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: MediaMetadataTable
+      PrimaryKey:
+        Name: FileId
+        Type: String
+
+  # ------------------------------------------------------------
+  # 3. API Gateway with Cognito Authorizer Options
+  # ------------------------------------------------------------
+  ServerlessMediaApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt MediaUserPool.Arn
+
+  # ------------------------------------------------------------
+  # 4. Storage, SNS Fan-Out & SQS Queues
+  # ------------------------------------------------------------
+  ProcessedOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  MediaNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: media-pipeline-events-topic
+
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  SNSToSQSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MediaNotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt ProcessingQueue.Arn
+
+  ProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProcessingQueue
+      PolicyDocument:
+        Statement:
+          - Sid: AllowSNSToSendMessages
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref MediaNotificationTopic
+
+  # ------------------------------------------------------------
+  # 5. Compute Workers
+  # ------------------------------------------------------------
+  MediaWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: media_worker.app.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: media-ingestion-raw-777772816164-ap-south-1
+        - S3CrudPolicy:
+            BucketName: !Ref ProcessedOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: MediaMetadataTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt MediaNotificationTopic.TopicName
+
+  QueueConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: queue_consumer.app.lambda_handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref MediaProcessingOrchestrator
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt MediaProcessingOrchestrator.Name
+      Events:
+        SQSBatchTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 5
+
+  MediaApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: api_handler.app.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: media-ingestion-raw-777772816164-ap-south-1
+        - DynamoDBReadPolicy:
+            TableName: MediaMetadataTable
+      Events:
+        GetMedia:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessMediaApi
+            Path: /media
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        GetUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessMediaApi
+            Path: /upload-url
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        GetDownloadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ServerlessMediaApi
+            Path: /download-url
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  # ------------------------------------------------------------
+  # 6. Step Functions Orchestration & EventBridge
+  # ------------------------------------------------------------
+  MediaProcessingOrchestrator:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Definition:
+        Comment: "Orchestrates Multi-Format Media Ingestion and Fan-Out Pipeline"
+        StartAt: InspectFileType
+        States:
+          InspectFileType:
+            Type: Task
+            Resource: !GetAtt MediaWorkerFunction.Arn
+            End: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MediaWorkerFunction
+
+  S3ToEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - media-ingestion-raw-777772816164-ap-south-1
+      Targets:
+        - Arn: !Ref MediaNotificationTopic
+          Id: TargetSNSTopic
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway Base URL"
+    Value: !Sub "https://${ServerlessMediaApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref MediaUserPool
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref MediaUserPoolClient
+  SNSTopicArn:
+    Description: "SNS Fan-Out Notification Topic ARN"
+    Value: !Ref MediaNotificationTopic
+  ProcessedBucketName:
+    Value: !Ref ProcessedOutputBucket
+  SQSQueueUrl:
+    Value: !Ref ProcessingQueue
+  StateMachineArn:
+    Value: !Ref MediaProcessingOrchestrator
